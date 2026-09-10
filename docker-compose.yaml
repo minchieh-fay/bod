@@ -1,0 +1,13 @@
+services:
+  bod:
+    image: alpine:3.22
+    platform: linux/amd64
+    working_dir: /app
+    command: ["/app/bod-linux-amd64", "/app/config.json"]
+    init: true
+    restart: unless-stopped
+    volumes:
+      - ./bod-linux-amd64:/app/bod-linux-amd64:ro
+      - ./config.json:/app/config.json:ro
+      - /root/key:/root/key:ro
+      - ./data:/app/data

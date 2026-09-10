@@ -1,0 +1,11 @@
+{
+  "symbol": "ETHUSDC",
+  "quantity": "0.02",
+  "spread": "0.0003",
+  "check_interval_seconds": 20,
+  "reprice_interval_seconds": 600,
+  "error_retry_seconds": 60,
+  "initial_side": "BUY",
+  "testnet": true,
+  "state_file": "/app/data/state.json"
+}
