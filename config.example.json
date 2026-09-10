@@ -2,6 +2,7 @@
   "symbol": "ETHUSDC",
   "quantity": "0.02",
   "spread": "0.0003",
+  "layers": 1,
   "check_interval_seconds": 20,
   "reprice_interval_seconds": 600,
   "error_retry_seconds": 60,

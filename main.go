@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -17,567 +18,477 @@ import (
 	"github.com/adshao/go-binance/v2/futures"
 )
 
-const clientOrderPrefix = "BOD_"
 const credentialsFile = "/root/key"
+const orderPrefix = "BOD"
 
 type Config struct {
-	APIKey                 string `json:"-"`
-	APISecret              string `json:"-"`
 	Symbol                 string `json:"symbol"`
 	Quantity               string `json:"quantity"`
 	Spread                 string `json:"spread"`
+	Layers                 int    `json:"layers"`
 	CheckIntervalSeconds   int    `json:"check_interval_seconds"`
 	RepriceIntervalSeconds int    `json:"reprice_interval_seconds"`
 	ErrorRetrySeconds      int    `json:"error_retry_seconds"`
-	InitialSide            string `json:"initial_side"`
 	Testnet                bool   `json:"testnet"`
 	StateFile              string `json:"state_file"`
 }
 
-type State struct {
+type ManagedOrder struct {
 	OrderID       int64  `json:"order_id"`
 	ClientOrderID string `json:"client_order_id"`
 	Side          string `json:"side"`
+	Layer         int    `json:"layer"`
 	Price         string `json:"price"`
 	Quantity      string `json:"quantity"`
-	ExecutedQty   string `json:"executed_qty"`
 	Status        string `json:"status"`
-	UpdatedAt     string `json:"updated_at"`
-	TotalProfit   string `json:"total_profit"`
-	CurrentProfit string `json:"current_profit"`
-	TotalTrades   int    `json:"total_trades"`
-	CurrentTrades int    `json:"current_trades"`
 }
 
-type StartupTrade struct {
-	OrderID  int64
-	Side     string
-	Price    *big.Float
-	Quantity *big.Float
+type Fill struct {
+	Side     string `json:"side"`
+	Price    string `json:"price"`
+	Quantity string `json:"quantity"`
 }
-
-type SymbolRules struct {
-	TickSize *big.Float
-	StepSize *big.Float
-	MinQty   *big.Float
+type State struct {
+	Orders        []ManagedOrder `json:"orders"`
+	PendingBuys   []Fill         `json:"pending_buys"`
+	PendingSells  []Fill         `json:"pending_sells"`
+	TotalProfit   string         `json:"total_profit"`
+	CurrentProfit string         `json:"current_profit"`
+	TotalTrades   int            `json:"total_trades"`
+	CurrentTrades int            `json:"current_trades"`
 }
-
+type Rules struct{ Tick, Step, MinQty *big.Float }
 type Bot struct {
-	cfg            Config
-	client         *futures.Client
-	rules          SymbolRules
-	state          State
-	statePath      string
-	startupTrades  []StartupTrade
-	processedFills map[int64]bool
-	startupProfit  *big.Float
-	startupReprice bool
-	lastOrderTime  time.Time
+	cfg         Config
+	client      *futures.Client
+	rules       Rules
+	state       State
+	statePath   string
+	lastReprice time.Time
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	configPath := "config.json"
+	path := "config.json"
 	if len(os.Args) > 1 {
-		configPath = os.Args[1]
+		path = os.Args[1]
 	}
-	cfg, err := loadConfig(configPath)
+	cfg, err := loadConfig(path)
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	if cfg.Testnet {
 		futures.UseTestnet = true
 	}
-	client := futures.NewClient(cfg.APIKey, cfg.APISecret)
-	bot := &Bot{
-		cfg:            cfg,
-		client:         client,
-		statePath:      cfg.StateFile,
-		processedFills: make(map[int64]bool),
-		startupProfit:  new(big.Float).SetInt64(0),
-	}
-	if err := bot.loadState(); err != nil {
+	key, secret, err := loadCredentials()
+	if err != nil {
 		log.Fatal(err)
 	}
-	bot.startupReprice = bot.state.OrderID != 0
-
+	b := &Bot{cfg: cfg, client: futures.NewClient(key, secret), statePath: cfg.StateFile}
+	if err = b.loadState(); err != nil {
+		log.Fatal(err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	if err := bot.loadRules(ctx); err != nil {
+	if err = b.loadRules(ctx); err != nil {
 		log.Fatal(err)
 	}
-
-	log.Printf("BOD started symbol=%s quantity=%s spread=%s testnet=%t", cfg.Symbol, cfg.Quantity, cfg.Spread, cfg.Testnet)
-	bot.run(ctx)
+	log.Printf("BOD grid started symbol=%s quantity=%s spread=%s layers=%d check=%ds reprice=%ds testnet=%t", cfg.Symbol, cfg.Quantity, cfg.Spread, cfg.Layers, cfg.CheckIntervalSeconds, cfg.RepriceIntervalSeconds, cfg.Testnet)
+	b.run(ctx)
 }
 
 func loadConfig(path string) (Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("read config: %w", err)
+	data, e := os.ReadFile(path)
+	if e != nil {
+		return Config{}, e
 	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, fmt.Errorf("parse config: %w", err)
+	var c Config
+	if e = json.Unmarshal(data, &c); e != nil {
+		return Config{}, e
 	}
-	cfg.Symbol = strings.ToUpper(strings.TrimSpace(cfg.Symbol))
-	cfg.InitialSide = strings.ToUpper(strings.TrimSpace(cfg.InitialSide))
-	if cfg.Symbol == "" {
-		cfg.Symbol = "ETHUSDC"
+	c.Symbol = strings.ToUpper(strings.TrimSpace(c.Symbol))
+	if c.Symbol == "" {
+		c.Symbol = "ETHUSDC"
 	}
-	if cfg.Quantity == "" {
-		cfg.Quantity = "0.009"
+	if c.Quantity == "" {
+		c.Quantity = "0.01"
 	}
-	if cfg.Spread == "" {
-		cfg.Spread = "0.0002"
+	if c.Spread == "" {
+		c.Spread = "0.0003"
 	}
-	if cfg.CheckIntervalSeconds <= 0 {
-		cfg.CheckIntervalSeconds = 20
+	if c.Layers <= 0 {
+		c.Layers = 1
 	}
-	if cfg.RepriceIntervalSeconds <= 0 {
-		cfg.RepriceIntervalSeconds = 600
+	if c.CheckIntervalSeconds <= 0 {
+		c.CheckIntervalSeconds = 20
 	}
-	if cfg.ErrorRetrySeconds <= 0 {
-		cfg.ErrorRetrySeconds = 60
+	if c.RepriceIntervalSeconds <= 0 {
+		c.RepriceIntervalSeconds = 600
 	}
-	if cfg.InitialSide != "BUY" && cfg.InitialSide != "SELL" {
-		return Config{}, errors.New("initial_side must be BUY or SELL")
+	if c.ErrorRetrySeconds <= 0 {
+		c.ErrorRetrySeconds = 60
 	}
-	if cfg.StateFile == "" {
-		cfg.StateFile = "state.json"
+	if c.StateFile == "" {
+		c.StateFile = "/app/data/state.json"
 	}
-	key, secret, keyErr := loadKeyFile(credentialsFile)
-	if keyErr != nil {
-		return Config{}, fmt.Errorf("cannot load credentials from %s: %w", credentialsFile, keyErr)
-	}
-	cfg.APIKey = key
-	cfg.APISecret = secret
-	return cfg, nil
+	return c, nil
 }
-
-func loadKeyFile(path string) (string, string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", err
+func loadCredentials() (string, string, error) {
+	d, e := os.ReadFile(credentialsFile)
+	if e != nil {
+		return "", "", e
 	}
-	lines := strings.Fields(string(data))
-	if len(lines) < 2 {
-		return "", "", fmt.Errorf("key file %s must contain API key and secret on two lines", path)
+	p := strings.Fields(string(d))
+	if len(p) < 2 {
+		return "", "", errors.New("/root/key must contain API key and secret")
 	}
-	return lines[0], lines[1], nil
+	return p[0], p[1], nil
 }
 
 func (b *Bot) loadRules(ctx context.Context) error {
-	info, err := b.client.NewExchangeInfoService().Do(ctx)
-	if err != nil {
-		return fmt.Errorf("load exchange info: %w", err)
+	info, e := b.client.NewExchangeInfoService().Do(ctx)
+	if e != nil {
+		return e
 	}
-	for _, symbol := range info.Symbols {
-		if symbol.Symbol != b.cfg.Symbol {
+	for _, s := range info.Symbols {
+		if s.Symbol != b.cfg.Symbol {
 			continue
 		}
-		if symbol.Status != "TRADING" {
-			return fmt.Errorf("symbol %s is not trading: %s", b.cfg.Symbol, symbol.Status)
-		}
-		var tick, step, minQty string
-		for _, f := range symbol.Filters {
-			filterType, _ := f["filterType"].(string)
-			switch filterType {
-			case "PRICE_FILTER":
+		var tick, step, min string
+		for _, f := range s.Filters {
+			t, _ := f["filterType"].(string)
+			if t == "PRICE_FILTER" {
 				tick, _ = f["tickSize"].(string)
-			case "LOT_SIZE":
+			}
+			if t == "LOT_SIZE" {
 				step, _ = f["stepSize"].(string)
-				minQty, _ = f["minQty"].(string)
+				min, _ = f["minQty"].(string)
 			}
 		}
-		var parseErr error
-		b.rules.TickSize, parseErr = decimal(tick)
-		if parseErr != nil {
-			return fmt.Errorf("parse tick size: %w", parseErr)
+		b.rules.Tick, e = decimal(tick)
+		if e != nil {
+			return e
 		}
-		b.rules.StepSize, parseErr = decimal(step)
-		if parseErr != nil {
-			return fmt.Errorf("parse step size: %w", parseErr)
+		b.rules.Step, e = decimal(step)
+		if e != nil {
+			return e
 		}
-		b.rules.MinQty, parseErr = decimal(minQty)
-		if parseErr != nil {
-			return fmt.Errorf("parse min qty: %w", parseErr)
-		}
-		return nil
+		b.rules.MinQty, e = decimal(min)
+		return e
 	}
 	return fmt.Errorf("symbol not found: %s", b.cfg.Symbol)
 }
-
 func (b *Bot) run(ctx context.Context) {
-	interval := time.Duration(b.cfg.CheckIntervalSeconds) * time.Second
 	for {
-		if err := b.reconcile(ctx); err != nil {
-			log.Printf("reconcile failed: %v; retrying in %d seconds", err, b.cfg.ErrorRetrySeconds)
-			if !sleepContext(ctx, time.Duration(b.cfg.ErrorRetrySeconds)*time.Second) {
+		if e := b.reconcile(ctx); e != nil {
+			log.Printf("reconcile failed: %v; retry in %ds", e, b.cfg.ErrorRetrySeconds)
+			if !sleep(ctx, time.Duration(b.cfg.ErrorRetrySeconds)*time.Second) {
 				return
 			}
 			continue
 		}
-		if !sleepContext(ctx, interval) {
+		if !sleep(ctx, time.Duration(b.cfg.CheckIntervalSeconds)*time.Second) {
 			return
 		}
 	}
 }
 
 func (b *Bot) reconcile(ctx context.Context) error {
-	orders, err := b.client.NewListOpenOrdersService().Symbol(b.cfg.Symbol).Do(ctx)
-	if err != nil {
-		return fmt.Errorf("list open orders: %w", err)
+	list, e := b.client.NewListOpenOrdersService().Symbol(b.cfg.Symbol).Do(ctx)
+	if e != nil {
+		return e
 	}
-	var own []*futures.Order
-	for _, order := range orders {
-		if strings.HasPrefix(order.ClientOrderID, clientOrderPrefix) {
-			own = append(own, order)
+	actual := map[int64]*futures.Order{}
+	for _, o := range list {
+		if parseLayer(o.ClientOrderID) > 0 {
+			actual[o.OrderID] = o
 		}
 	}
-	if len(own) > 1 {
-		return fmt.Errorf("found %d open BOD orders; refusing to create another order", len(own))
+	if e = b.processFinished(ctx, actual); e != nil {
+		return e
 	}
-	if len(own) == 1 {
-		return b.checkOwnOrder(ctx, own[0])
-	}
-
-	if b.state.OrderID != 0 {
-		// The open-order query is authoritative. Re-query the known order before
-		// adopting the account position after a restart or a lost API response.
-		order, queryErr := b.client.NewGetOrderService().Symbol(b.cfg.Symbol).OrderID(b.state.OrderID).Do(ctx)
-		if queryErr != nil {
-			return fmt.Errorf("check known order %d: %w", b.state.OrderID, queryErr)
+	b.state.Orders = nil
+	for _, o := range actual {
+		n := parseLayer(o.ClientOrderID)
+		if n > 0 {
+			b.state.Orders = append(b.state.Orders, ManagedOrder{o.OrderID, o.ClientOrderID, string(o.Side), n, o.Price, o.OrigQuantity, string(o.Status)})
 		}
-		if order.Status == futures.OrderStatusTypeNew || order.Status == futures.OrderStatusTypePartiallyFilled {
-			return b.checkOwnOrder(ctx, order)
-		}
-		if order.Status == futures.OrderStatusTypeFilled {
-			// The order may have filled between two polling cycles. Use its
-			// executed quantity instead of the configured default quantity.
-			return b.checkOwnOrder(ctx, order)
-		}
-		if b.state.Side != "BUY" && b.state.Side != "SELL" {
-			return fmt.Errorf("known order %d ended as %s but saved order side is invalid: %q", order.OrderID, order.Status, b.state.Side)
-		}
-		// Any terminal order other than FILLED is replaced using the current
-		// configured full quantity. This also handles partial fills whose
-		// remainder would be below the exchange minimum quantity.
-		price, priceErr := b.referencePrice(ctx)
-		if priceErr != nil {
-			return priceErr
-		}
-		log.Printf("order=%d ended as %s executed=%s; replacing full quantity=%s same side=%s at a new price", order.OrderID, order.Status, order.ExecutedQuantity, b.state.Quantity, b.state.Side)
-		return b.placeOrder(ctx, b.state.Side, price)
 	}
-
-	// No open BOD order: automatically adopt the current net position.
-	position, err := b.currentPosition(ctx)
-	if err != nil {
-		return err
+	if e = b.saveState(); e != nil {
+		return e
 	}
-	side := b.cfg.InitialSide
-	if position.Sign() > 0 {
-		side = "SELL"
-	} else if position.Sign() < 0 {
-		side = "BUY"
-	}
-	price, err := b.referencePrice(ctx)
-	if err != nil {
-		return err
-	}
-	if position.Sign() == 0 {
-		log.Printf("no BOD order and flat position; using initial side %s", side)
-	} else {
-		log.Printf("no BOD order; adopting current position %s; first side %s", position.Text('f', -1), side)
-	}
-	return b.placeOrder(ctx, side, price)
+	return b.manageGrid(ctx)
 }
-
-func (b *Bot) checkOwnOrder(ctx context.Context, open *futures.Order) error {
-	if open.Status == futures.OrderStatusTypeNew || open.Status == futures.OrderStatusTypePartiallyFilled {
-		log.Printf("waiting order=%d side=%s status=%s executed=%s/%s", open.OrderID, open.Side, open.Status, open.ExecutedQuantity, open.OrigQuantity)
-		previousStats := b.state
-		b.state = stateFromOrder(open)
-		b.state.TotalProfit = previousStats.TotalProfit
-		b.state.CurrentProfit = previousStats.CurrentProfit
-		b.state.TotalTrades = previousStats.TotalTrades
-		b.state.CurrentTrades = previousStats.CurrentTrades
-		if open.Time > 0 {
-			b.lastOrderTime = time.UnixMilli(open.Time)
-		}
-		if err := b.saveState(); err != nil {
-			return err
-		}
-		if open.Status == futures.OrderStatusTypeNew && b.shouldReprice() {
-			return b.repriceOrder(ctx, open)
-		}
-		b.startupReprice = false
-		return nil
-	}
-	if open.Status != futures.OrderStatusTypeFilled {
-		return fmt.Errorf("BOD order %d has unexpected status %s", open.OrderID, open.Status)
-	}
-
-	qty, err := b.normalizeQuantity(open.ExecutedQuantity)
-	if err != nil {
-		return fmt.Errorf("normalize executed quantity: %w", err)
-	}
-	if qty.Sign() <= 0 {
-		return fmt.Errorf("order %d is FILLED but executed quantity is zero", open.OrderID)
-	}
-	if err := b.recordStartupTrade(open, qty); err != nil {
-		return err
-	}
-	side := "SELL"
-	if open.Side == "SELL" {
-		side = "BUY"
-	}
-	price, err := b.referencePrice(ctx)
-	if err != nil {
-		return err
-	}
-	log.Printf("order filled order=%d; placing reverse side=%s quantity=%s", open.OrderID, side, qty.Text('f', -1))
-	return b.placeOrder(ctx, side, price)
-}
-
-func (b *Bot) recordStartupTrade(order *futures.Order, quantity *big.Float) error {
-	if b.processedFills[order.OrderID] {
-		return nil
-	}
-	priceText := order.AvgPrice
-	if priceText == "" || priceText == "0" {
-		priceText = order.Price
-	}
-	price, err := decimal(priceText)
-	if err != nil || price.Sign() <= 0 {
-		return fmt.Errorf("invalid filled price for order %d: %q", order.OrderID, priceText)
-	}
-	b.processedFills[order.OrderID] = true
-	b.startupTrades = append(b.startupTrades, StartupTrade{
-		OrderID:  order.OrderID,
-		Side:     string(order.Side),
-		Price:    price,
-		Quantity: new(big.Float).Copy(quantity),
-	})
-
-	if len(b.startupTrades)%2 != 0 {
-		b.state.CurrentTrades = len(b.startupTrades)
-		b.state.CurrentProfit = b.startupProfit.Text('f', 8)
-		if err := b.saveState(); err != nil {
-			return fmt.Errorf("save trade statistics: %w", err)
-		}
-		b.logProfit()
-		return nil
-	}
-	first := b.startupTrades[len(b.startupTrades)-2]
-	second := b.startupTrades[len(b.startupTrades)-1]
-	if first.Side == second.Side {
-		return fmt.Errorf("two consecutive filled BOD orders have the same side: %s", first.Side)
-	}
-	matchedQty := first.Quantity
-	if second.Quantity.Cmp(matchedQty) < 0 {
-		matchedQty = second.Quantity
-	}
-	profit := new(big.Float)
-	if first.Side == "BUY" {
-		profit.Sub(second.Price, first.Price)
-	} else {
-		profit.Sub(first.Price, second.Price)
-	}
-	profit.Mul(profit, matchedQty)
-	b.startupProfit.Add(b.startupProfit, profit)
-	b.state.CurrentTrades = len(b.startupTrades)
-	b.state.CurrentProfit = b.startupProfit.Text('f', 8)
-	if err := b.saveState(); err != nil {
-		return fmt.Errorf("save trade statistics: %w", err)
-	}
-	b.logProfit()
-	return nil
-}
-
-func (b *Bot) logProfit() {
-	log.Printf("时间=%s 交易次数=%d 总收益=%s USDC 当前启动收益=%s USDC", time.Now().Format(time.RFC3339), b.state.CurrentTrades, b.state.TotalProfit, b.state.CurrentProfit)
-}
-
-func (b *Bot) placeOrder(ctx context.Context, side, referencePrice string, quantities ...string) error {
-	quantity := b.cfg.Quantity
-	if len(quantities) == 1 {
-		quantity = quantities[0]
-	}
-	qty, err := b.normalizeQuantity(quantity)
-	if err != nil {
-		return fmt.Errorf("normalize quantity: %w", err)
-	}
-	price, err := b.calculatePrice(side, referencePrice)
-	if err != nil {
-		return err
-	}
-	qtyText := qty.Text('f', -1)
-	priceText := price.Text('f', -1)
-	clientOrderID := fmt.Sprintf("%s%d", clientOrderPrefix, time.Now().UnixNano())
-
-	order, err := b.client.NewCreateOrderService().
-		Symbol(b.cfg.Symbol).
-		Side(futures.SideType(side)).
-		Type(futures.OrderTypeLimit).
-		TimeInForce(futures.TimeInForceTypeGTC).
-		Quantity(qtyText).
-		Price(priceText).
-		NewClientOrderID(clientOrderID).
-		Do(ctx)
-	if err != nil {
-		return fmt.Errorf("create %s order: %w", side, err)
-	}
-	previousStats := b.state
-	b.state = State{
-		OrderID: order.OrderID, ClientOrderID: order.ClientOrderID, Side: side,
-		Price: priceText, Quantity: qtyText, ExecutedQty: order.ExecutedQuantity,
-		Status: string(order.Status), UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-		TotalProfit: previousStats.TotalProfit, CurrentProfit: previousStats.CurrentProfit,
-		TotalTrades: previousStats.TotalTrades, CurrentTrades: previousStats.CurrentTrades,
-	}
-	b.lastOrderTime = time.Now()
-	b.startupReprice = false
-	if err := b.saveState(); err != nil {
-		return fmt.Errorf("save order state: %w", err)
-	}
-	log.Printf("created order=%d client_order_id=%s side=%s quantity=%s price=%s", order.OrderID, clientOrderID, side, qtyText, priceText)
-	return nil
-}
-
-func (b *Bot) calculatePrice(side, referencePrice string) (*big.Float, error) {
-	spread, err := decimal(b.cfg.Spread)
-	if err != nil || spread.Sign() < 0 {
-		return nil, fmt.Errorf("invalid spread %q", b.cfg.Spread)
-	}
-	ref, err := decimal(referencePrice)
-	if err != nil || ref.Sign() <= 0 {
-		return nil, fmt.Errorf("invalid reference price %q", referencePrice)
-	}
-	multiplier := new(big.Float).SetFloat64(1)
-	if side == "BUY" {
-		multiplier.Sub(multiplier, spread)
-	} else {
-		multiplier.Add(multiplier, spread)
-	}
-	price := floorToStep(new(big.Float).Mul(ref, multiplier), b.rules.TickSize)
-	if price.Sign() <= 0 {
-		return nil, errors.New("calculated price is not positive")
-	}
-	return price, nil
-}
-
-func (b *Bot) shouldReprice() bool {
-	return b.startupReprice || b.lastOrderTime.IsZero() || time.Since(b.lastOrderTime) >= time.Duration(b.cfg.RepriceIntervalSeconds)*time.Second
-}
-
-func (b *Bot) repriceOrder(ctx context.Context, open *futures.Order) error {
-	reference, err := b.referencePrice(ctx)
-	if err != nil {
-		return err
-	}
-	newPrice, err := b.calculatePrice(string(open.Side), reference)
-	if err != nil {
-		return err
-	}
-	oldPrice, err := decimal(open.Price)
-	if err != nil {
-		return fmt.Errorf("invalid existing order price %q: %w", open.Price, err)
-	}
-	closer := (open.Side == futures.SideTypeBuy && newPrice.Cmp(oldPrice) > 0) ||
-		(open.Side == futures.SideTypeSell && newPrice.Cmp(oldPrice) < 0)
-	b.startupReprice = false
-	b.lastOrderTime = time.Now()
-	if !closer {
-		log.Printf("order=%d reprice checked; keeping price=%s new_price=%s", open.OrderID, open.Price, newPrice.Text('f', -1))
-		return nil
-	}
-	if _, err := b.client.NewCancelOrderService().Symbol(b.cfg.Symbol).OrderID(open.OrderID).Do(ctx); err != nil {
-		return fmt.Errorf("cancel order %d for reprice: %w", open.OrderID, err)
-	}
-	log.Printf("order=%d reprice old_price=%s new_price=%s", open.OrderID, open.Price, newPrice.Text('f', -1))
-	return b.placeOrder(ctx, string(open.Side), reference)
-}
-
-func (b *Bot) currentPosition(ctx context.Context) (*big.Float, error) {
-	positions, err := b.client.NewGetPositionRiskService().Symbol(b.cfg.Symbol).Do(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get position: %w", err)
-	}
-	total := new(big.Float).SetInt64(0)
-	found := false
-	for _, position := range positions {
-		if position.Symbol != b.cfg.Symbol {
+func (b *Bot) processFinished(ctx context.Context, actual map[int64]*futures.Order) error {
+	for _, old := range append([]ManagedOrder(nil), b.state.Orders...) {
+		if _, ok := actual[old.OrderID]; ok {
 			continue
 		}
-		found = true
-		value, parseErr := decimal(position.PositionAmt)
-		if parseErr != nil {
-			return nil, fmt.Errorf("invalid position amount %q: %w", position.PositionAmt, parseErr)
+		o, e := b.client.NewGetOrderService().Symbol(b.cfg.Symbol).OrderID(old.OrderID).Do(ctx)
+		if e != nil {
+			return e
 		}
-		total.Add(total, value)
+		if o.Status == futures.OrderStatusTypeFilled {
+			if e = b.recordFill(o); e != nil {
+				return e
+			}
+		} else {
+			log.Printf("order=%d ended status=%s executed=%s", o.OrderID, o.Status, o.ExecutedQuantity)
+		}
 	}
-	if found {
-		return total, nil
-	}
-	return nil, fmt.Errorf("position for %s not found", b.cfg.Symbol)
+	return nil
 }
 
+func (b *Bot) manageGrid(ctx context.Context) error {
+	buys, sells := b.sideOrders()
+	if len(b.state.Orders) == 0 {
+		return b.createGrid(ctx)
+	}
+	if len(buys) == len(sells) && len(buys) < b.cfg.Layers {
+		return b.rebuildGrid(ctx, "equal but incomplete sides")
+	}
+	if len(buys) == 0 || len(sells) == 0 {
+		return b.normalizeSingleSide(ctx, buys, sells)
+	}
+	if len(buys) != len(sells) && (b.lastReprice.IsZero() || time.Since(b.lastReprice) >= time.Duration(b.cfg.RepriceIntervalSeconds)*time.Second) {
+		return b.repriceLargerSide(ctx, buys, sells)
+	}
+	return nil
+}
+func (b *Bot) createGrid(ctx context.Context) error {
+	ref, e := b.referencePrice(ctx)
+	if e != nil {
+		return e
+	}
+	for i := 1; i <= b.cfg.Layers; i++ {
+		if e = b.placeLayer(ctx, "BUY", i, ref); e != nil {
+			return e
+		}
+		if e = b.placeLayer(ctx, "SELL", i, ref); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+func (b *Bot) rebuildGrid(ctx context.Context, reason string) error {
+	log.Printf("rebuilding full grid: %s", reason)
+	if e := b.cancelAll(ctx); e != nil {
+		return e
+	}
+	b.state.Orders = nil
+	return b.createGrid(ctx)
+}
+func (b *Bot) normalizeSingleSide(ctx context.Context, buys, sells []ManagedOrder) error {
+	side, orders := "SELL", sells
+	if len(buys) > 0 {
+		side, orders = "BUY", buys
+	}
+	var cancel []ManagedOrder
+	for _, o := range orders {
+		if o.Layer != 1 {
+			cancel = append(cancel, o)
+		}
+	}
+	if len(cancel) == 0 {
+		return nil
+	}
+	for _, o := range cancel {
+		if _, e := b.client.NewCancelOrderService().Symbol(b.cfg.Symbol).OrderID(o.OrderID).Do(ctx); e != nil {
+			return e
+		}
+	}
+	ref, e := b.referencePrice(ctx)
+	if e != nil {
+		return e
+	}
+	for range cancel {
+		if e = b.placeLayer(ctx, side, 1, ref); e != nil {
+			return e
+		}
+	}
+	b.lastReprice = time.Now()
+	return nil
+}
+func (b *Bot) repriceLargerSide(ctx context.Context, buys, sells []ManagedOrder) error {
+	side, orders := "BUY", buys
+	if len(sells) > len(buys) {
+		side, orders = "SELL", sells
+	}
+	ref, e := b.referencePrice(ctx)
+	if e != nil {
+		return e
+	}
+	for _, o := range orders {
+		if _, e = b.client.NewCancelOrderService().Symbol(b.cfg.Symbol).OrderID(o.OrderID).Do(ctx); e != nil {
+			return e
+		}
+	}
+	for _, o := range orders {
+		if e = b.placeLayer(ctx, side, o.Layer, ref); e != nil {
+			return e
+		}
+	}
+	b.lastReprice = time.Now()
+	return nil
+}
+func (b *Bot) cancelAll(ctx context.Context) error {
+	for _, o := range b.state.Orders {
+		if _, e := b.client.NewCancelOrderService().Symbol(b.cfg.Symbol).OrderID(o.OrderID).Do(ctx); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+func (b *Bot) placeLayer(ctx context.Context, side string, layer int, reference string) error {
+	qty, e := b.normalize(b.cfg.Quantity)
+	if e != nil {
+		return e
+	}
+	ref, e := decimal(reference)
+	if e != nil {
+		return e
+	}
+	sp, e := decimal(b.cfg.Spread)
+	if e != nil {
+		return e
+	}
+	mult := new(big.Float).SetInt64(int64(2*layer - 1))
+	offset := new(big.Float).Mul(sp, mult)
+	factor := new(big.Float).SetFloat64(1)
+	if side == "BUY" {
+		factor.Sub(factor, offset)
+	} else {
+		factor.Add(factor, offset)
+	}
+	price := floor(new(big.Float).Mul(ref, factor), b.rules.Tick)
+	if price.Sign() <= 0 {
+		return errors.New("calculated price is not positive")
+	}
+	qt, pt := qty.Text('f', -1), price.Text('f', -1)
+	id := fmt.Sprintf("%s%d_%d", orderPrefix, layer, time.Now().UnixNano())
+	o, e := b.client.NewCreateOrderService().Symbol(b.cfg.Symbol).Side(futures.SideType(side)).Type(futures.OrderTypeLimit).TimeInForce(futures.TimeInForceTypeGTC).Quantity(qt).Price(pt).NewClientOrderID(id).Do(ctx)
+	if e != nil {
+		return e
+	}
+	b.state.Orders = append(b.state.Orders, ManagedOrder{o.OrderID, id, side, layer, pt, qt, string(o.Status)})
+	return b.saveState()
+}
+
+func (b *Bot) recordFill(o *futures.Order) error {
+	price := o.AvgPrice
+	if price == "" || price == "0" {
+		price = o.Price
+	}
+	q, e := b.normalize(o.ExecutedQuantity)
+	if e != nil {
+		return e
+	}
+	b.state.CurrentTrades++
+	fill := Fill{string(o.Side), price, q.Text('f', -1)}
+	if fill.Side == "BUY" {
+		b.state.PendingBuys = append(b.state.PendingBuys, fill)
+	} else {
+		b.state.PendingSells = append(b.state.PendingSells, fill)
+	}
+	for len(b.state.PendingBuys) > 0 && len(b.state.PendingSells) > 0 {
+		buy, sell := b.state.PendingBuys[0], b.state.PendingSells[0]
+		bp, _ := decimal(buy.Price)
+		sp, _ := decimal(sell.Price)
+		bq, _ := decimal(buy.Quantity)
+		sq, _ := decimal(sell.Quantity)
+		matched := bq
+		if sq.Cmp(matched) < 0 {
+			matched = sq
+		}
+		profit := new(big.Float).Sub(sp, bp)
+		profit.Mul(profit, matched)
+		cur, _ := decimal(b.state.CurrentProfit)
+		cur.Add(cur, profit)
+		b.state.CurrentProfit = cur.Text('f', 8)
+		b.state.PendingBuys[0].Quantity = new(big.Float).Sub(bq, matched).Text('f', -1)
+		b.state.PendingSells[0].Quantity = new(big.Float).Sub(sq, matched).Text('f', -1)
+		if zero(b.state.PendingBuys[0].Quantity) {
+			b.state.PendingBuys = b.state.PendingBuys[1:]
+		}
+		if zero(b.state.PendingSells[0].Quantity) {
+			b.state.PendingSells = b.state.PendingSells[1:]
+		}
+		log.Printf("时间=%s 交易次数=%d 总收益=%s USDC 当前启动收益=%s USDC", time.Now().Format(time.RFC3339), b.state.CurrentTrades, b.state.TotalProfit, b.state.CurrentProfit)
+	}
+	return b.saveState()
+}
+
+func zero(value string) bool { f, err := decimal(value); return err != nil || f.Sign() == 0 }
+
+func (b *Bot) sideOrders() ([]ManagedOrder, []ManagedOrder) {
+	var buy, sell []ManagedOrder
+	for _, o := range b.state.Orders {
+		if o.Side == "BUY" {
+			buy = append(buy, o)
+		} else if o.Side == "SELL" {
+			sell = append(sell, o)
+		}
+	}
+	sort.Slice(buy, func(i, j int) bool { return buy[i].Layer < buy[j].Layer })
+	sort.Slice(sell, func(i, j int) bool { return sell[i].Layer < sell[j].Layer })
+	return buy, sell
+}
 func (b *Bot) referencePrice(ctx context.Context) (string, error) {
-	prices, err := b.client.NewListPricesService().Symbol(b.cfg.Symbol).Do(ctx)
-	if err != nil {
-		return "", fmt.Errorf("get mark price: %w", err)
+	p, e := b.client.NewListPricesService().Symbol(b.cfg.Symbol).Do(ctx)
+	if e != nil {
+		return "", e
 	}
-	if len(prices) != 1 {
-		return "", fmt.Errorf("unexpected mark price response count: %d", len(prices))
+	if len(p) != 1 {
+		return "", errors.New("unexpected price response")
 	}
-	return prices[0].Price, nil
+	return p[0].Price, nil
 }
-
-func (b *Bot) normalizeQuantity(value string) (*big.Float, error) {
-	qty, err := decimal(value)
-	if err != nil {
-		return nil, err
+func (b *Bot) normalize(v string) (*big.Float, error) {
+	q, e := decimal(v)
+	if e != nil {
+		return nil, e
 	}
-	qty = floorToStep(qty, b.rules.StepSize)
-	if qty.Cmp(b.rules.MinQty) < 0 {
-		return nil, fmt.Errorf("quantity %s is below min quantity %s", qty.Text('f', -1), b.rules.MinQty.Text('f', -1))
+	q = floor(q, b.rules.Step)
+	if q.Cmp(b.rules.MinQty) < 0 {
+		return nil, fmt.Errorf("quantity below minimum: %s", q.Text('f', -1))
 	}
-	return qty, nil
+	return q, nil
 }
-
-func decimal(value string) (*big.Float, error) {
-	result, _, err := big.ParseFloat(strings.TrimSpace(value), 10, 256, big.ToNearestEven)
-	if err != nil {
-		return nil, fmt.Errorf("invalid decimal %q: %w", value, err)
+func decimal(v string) (*big.Float, error) {
+	f, _, e := big.ParseFloat(strings.TrimSpace(v), 10, 256, big.ToNearestEven)
+	if e != nil {
+		return nil, e
 	}
-	return result, nil
+	return f, nil
 }
-
-func floorToStep(value, step *big.Float) *big.Float {
-	quotient := new(big.Float).Quo(value, step)
-	integer, _ := quotient.Int(nil)
-	return new(big.Float).Mul(new(big.Float).SetInt(integer), step)
+func floor(v, s *big.Float) *big.Float {
+	q := new(big.Float).Quo(v, s)
+	i, _ := q.Int(nil)
+	return new(big.Float).Mul(new(big.Float).SetInt(i), s)
 }
-
-func stateFromOrder(order *futures.Order) State {
-	return State{OrderID: order.OrderID, ClientOrderID: order.ClientOrderID, Side: string(order.Side), Price: order.Price, Quantity: order.OrigQuantity, ExecutedQty: order.ExecutedQuantity, Status: string(order.Status), UpdatedAt: time.Now().UTC().Format(time.RFC3339)}
+func parseLayer(id string) int {
+	p := strings.SplitN(id, "_", 2)
+	if len(p) != 2 || !strings.HasPrefix(p[0], orderPrefix) {
+		return 0
+	}
+	var n int
+	if _, e := fmt.Sscanf(strings.TrimPrefix(p[0], orderPrefix), "%d", &n); e != nil {
+		return 0
+	}
+	return n
 }
 
 func (b *Bot) loadState() error {
-	data, err := os.ReadFile(b.statePath)
-	if errors.Is(err, os.ErrNotExist) {
+	d, e := os.ReadFile(b.statePath)
+	if errors.Is(e, os.ErrNotExist) {
 		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("read state: %w", err)
+	if e != nil {
+		return e
 	}
-	if err := json.Unmarshal(data, &b.state); err != nil {
-		return fmt.Errorf("parse state: %w", err)
+	if e = json.Unmarshal(d, &b.state); e != nil {
+		return e
 	}
 	if b.state.TotalProfit == "" {
 		b.state.TotalProfit = "0"
@@ -585,53 +496,46 @@ func (b *Bot) loadState() error {
 	if b.state.CurrentProfit == "" {
 		b.state.CurrentProfit = "0"
 	}
-	totalProfit, err := decimal(b.state.TotalProfit)
-	if err != nil {
-		return fmt.Errorf("parse total profit: %w", err)
+	total, e := decimal(b.state.TotalProfit)
+	if e != nil {
+		return e
 	}
-	currentProfit, err := decimal(b.state.CurrentProfit)
-	if err != nil {
-		return fmt.Errorf("parse current profit: %w", err)
+	cur, e := decimal(b.state.CurrentProfit)
+	if e != nil {
+		return e
 	}
-	// Commit the previous process session to the lifetime total, then start
-	// a fresh current session while preserving the order recovery fields.
-	totalProfit.Add(totalProfit, currentProfit)
-	b.state.TotalProfit = totalProfit.Text('f', 8)
+	total.Add(total, cur)
+	b.state.TotalProfit = total.Text('f', 8)
 	b.state.CurrentProfit = "0.00000000"
 	b.state.TotalTrades += b.state.CurrentTrades
 	b.state.CurrentTrades = 0
-	b.startupProfit = new(big.Float).SetInt64(0)
-	b.startupTrades = nil
-	if err := b.saveState(); err != nil {
-		return fmt.Errorf("roll startup statistics: %w", err)
-	}
-	return nil
+	b.state.PendingBuys = nil
+	b.state.PendingSells = nil
+	return b.saveState()
 }
-
 func (b *Bot) saveState() error {
-	data, err := json.MarshalIndent(b.state, "", "  ")
-	if err != nil {
-		return err
+	d, e := json.MarshalIndent(b.state, "", "  ")
+	if e != nil {
+		return e
 	}
 	if dir := filepath.Dir(b.statePath); dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
+		if e = os.MkdirAll(dir, 0755); e != nil {
+			return e
 		}
 	}
 	tmp := b.statePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return err
+	if e = os.WriteFile(tmp, d, 0600); e != nil {
+		return e
 	}
 	return os.Rename(tmp, b.statePath)
 }
-
-func sleepContext(ctx context.Context, duration time.Duration) bool {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
+func sleep(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
 	select {
 	case <-ctx.Done():
 		return false
-	case <-timer.C:
+	case <-t.C:
 		return true
 	}
 }
