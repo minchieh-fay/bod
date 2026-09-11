@@ -29,7 +29,7 @@ go build -o bod .
 - `state.json` 用于保存最近的程序订单状态，建议持久化到容器卷。
 - 盈利统计从本次进程启动开始；每个完整成交订单只统计一次，按相邻的 BUY/SELL 两笔成对计算。奇数笔最后一笔只展示交易次数，不计入总收益。日志格式为 `时间=... 交易次数=... 总收益=... USDC`。
 - `state.json` 中的 `total_profit` 是历史累计总收益，`current_profit` 是本次启动后的收益；运行期间只更新 `current_profit`，程序启动时才会把上次的 `current_profit` 并入 `total_profit`，然后将 `current_profit` 清零。
-- `check_interval_seconds` 控制成交检查间隔，`reprice_interval_seconds` 控制挂单价格重新校准间隔，默认分别为 20 秒和 600 秒。启动时如果已有程序挂单，会立即校准一次。
+- `check_interval_seconds` 控制成交检查间隔，`reprice_interval_seconds` 控制所有现有程序挂单的价格重新校准间隔，默认分别为 20 秒和 600 秒。启动时如果已有程序挂单，会立即校准一次。
 - `layers` 控制挂单层数，默认 `1`。第 `n` 层的振幅倍数为 `2*n-1`，例如 `1A`、`3A`、`5A`。每一层使用独立的 `BOD<n>_...` 订单标识。
 - 成交收益按 BUY 和 SELL 两个 FIFO 队列配对；连续单边成交会暂存，未配对成交不计入收益。程序重启时会清空未配对队列，避免跨启动周期配对。
 

@@ -247,11 +247,11 @@ func (b *Bot) manageGrid(ctx context.Context) error {
 	if len(buys) == len(sells) && len(buys) < b.cfg.Layers {
 		return b.rebuildGrid(ctx, "equal but incomplete sides")
 	}
+	if b.lastReprice.IsZero() || time.Since(b.lastReprice) >= time.Duration(b.cfg.RepriceIntervalSeconds)*time.Second {
+		return b.repriceAll(ctx)
+	}
 	if len(buys) == 0 || len(sells) == 0 {
 		return b.normalizeSingleSide(ctx, buys, sells)
-	}
-	if len(buys) != len(sells) && (b.lastReprice.IsZero() || time.Since(b.lastReprice) >= time.Duration(b.cfg.RepriceIntervalSeconds)*time.Second) {
-		return b.repriceLargerSide(ctx, buys, sells)
 	}
 	return nil
 }
@@ -268,6 +268,7 @@ func (b *Bot) createGrid(ctx context.Context) error {
 			return e
 		}
 	}
+	b.lastReprice = time.Now()
 	return nil
 }
 func (b *Bot) rebuildGrid(ctx context.Context, reason string) error {
@@ -309,22 +310,22 @@ func (b *Bot) normalizeSingleSide(ctx context.Context, buys, sells []ManagedOrde
 	b.lastReprice = time.Now()
 	return nil
 }
-func (b *Bot) repriceLargerSide(ctx context.Context, buys, sells []ManagedOrder) error {
-	side, orders := "BUY", buys
-	if len(sells) > len(buys) {
-		side, orders = "SELL", sells
-	}
+
+// Reprice every remaining managed order at the scheduled recalibration point.
+func (b *Bot) repriceAll(ctx context.Context) error {
 	ref, e := b.referencePrice(ctx)
 	if e != nil {
 		return e
 	}
+	orders := append([]ManagedOrder(nil), b.state.Orders...)
+	log.Printf("repricing all managed orders count=%d reference=%s", len(orders), ref)
 	for _, o := range orders {
 		if _, e = b.client.NewCancelOrderService().Symbol(b.cfg.Symbol).OrderID(o.OrderID).Do(ctx); e != nil {
 			return e
 		}
 	}
 	for _, o := range orders {
-		if e = b.placeLayer(ctx, side, o.Layer, ref); e != nil {
+		if e = b.placeLayer(ctx, o.Side, o.Layer, ref); e != nil {
 			return e
 		}
 	}
