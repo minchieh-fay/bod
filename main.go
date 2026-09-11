@@ -366,7 +366,8 @@ func (b *Bot) placeLayer(ctx context.Context, side string, layer int, reference 
 	if price.Sign() <= 0 {
 		return errors.New("calculated price is not positive")
 	}
-	qt, pt := qty.Text('f', -1), price.Text('f', -1)
+	// Binance requires ETHUSDC prices to have at most two decimal places.
+	qt, pt := qty.Text('f', 3), price.Text('f', 2)
 	id := fmt.Sprintf("%s%d_%d", orderPrefix, layer, time.Now().UnixNano())
 	o, e := b.client.NewCreateOrderService().Symbol(b.cfg.Symbol).Side(futures.SideType(side)).Type(futures.OrderTypeLimit).TimeInForce(futures.TimeInForceTypeGTC).Quantity(qt).Price(pt).NewClientOrderID(id).Do(ctx)
 	if e != nil {
