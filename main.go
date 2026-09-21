@@ -261,10 +261,10 @@ func (b *Bot) createGrid(ctx context.Context) error {
 		return e
 	}
 	for i := 1; i <= b.cfg.Layers; i++ {
-		if e = b.placeLayer(ctx, "BUY", i, ref); e != nil {
+		if e = b.placeLayer(ctx, "BUY", i, ref, ""); e != nil {
 			return e
 		}
-		if e = b.placeLayer(ctx, "SELL", i, ref); e != nil {
+		if e = b.placeLayer(ctx, "SELL", i, ref, ""); e != nil {
 			return e
 		}
 	}
@@ -302,8 +302,8 @@ func (b *Bot) normalizeSingleSide(ctx context.Context, buys, sells []ManagedOrde
 	if e != nil {
 		return e
 	}
-	for range cancel {
-		if e = b.placeLayer(ctx, side, 1, ref); e != nil {
+	for _, o := range cancel {
+		if e = b.placeLayer(ctx, side, 1, ref, o.Quantity); e != nil {
 			return e
 		}
 	}
@@ -325,7 +325,7 @@ func (b *Bot) repriceAll(ctx context.Context) error {
 		}
 	}
 	for _, o := range orders {
-		if e = b.placeLayer(ctx, o.Side, o.Layer, ref); e != nil {
+		if e = b.placeLayer(ctx, o.Side, o.Layer, ref, o.Quantity); e != nil {
 			return e
 		}
 	}
@@ -341,11 +341,26 @@ func (b *Bot) cancelAll(ctx context.Context) error {
 	return nil
 }
 
-func (b *Bot) placeLayer(ctx context.Context, side string, layer int, reference string) error {
-	qty, e := b.normalize(b.cfg.Quantity)
+// placeLayer 按指定层级和数量创建限价单。
+func (b *Bot) placeLayer(
+	ctx context.Context,
+	side string,
+	layer int,
+	reference string,
+	quantity string,
+) error {
+	// step.1 确定新订单数量；调整层和重新定价时沿用原订单数量
+	var qty *big.Float
+	var e error
+	if quantity == "" {
+		qty, e = b.layerQuantity(layer)
+	} else {
+		qty, e = b.normalize(quantity)
+	}
 	if e != nil {
 		return e
 	}
+	// step.2 根据参考价、价差和层级计算限价价格
 	ref, e := decimal(reference)
 	if e != nil {
 		return e
@@ -354,7 +369,7 @@ func (b *Bot) placeLayer(ctx context.Context, side string, layer int, reference 
 	if e != nil {
 		return e
 	}
-	mult := new(big.Float).SetInt64(int64(2*layer - 1))
+	mult := new(big.Float).SetInt64(int64(3*layer - 2))
 	offset := new(big.Float).Mul(sp, mult)
 	factor := new(big.Float).SetFloat64(1)
 	if side == "BUY" {
@@ -366,6 +381,7 @@ func (b *Bot) placeLayer(ctx context.Context, side string, layer int, reference 
 	if price.Sign() <= 0 {
 		return errors.New("calculated price is not positive")
 	}
+	// step.3 提交交易所订单并保存本地订单状态
 	// Binance requires ETHUSDC prices to have at most two decimal places.
 	qt, pt := qty.Text('f', 3), price.Text('f', 2)
 	id := fmt.Sprintf("%s%d_%d", orderPrefix, layer, time.Now().UnixNano())
@@ -375,6 +391,22 @@ func (b *Bot) placeLayer(ctx context.Context, side string, layer int, reference 
 	}
 	b.state.Orders = append(b.state.Orders, ManagedOrder{o.OrderID, id, side, layer, pt, qt, string(o.Status)})
 	return b.saveState()
+}
+
+// layerQuantity 计算新建订单在指定层级的买入数量。
+func (b *Bot) layerQuantity(layer int) (*big.Float, error) {
+	// step.1 读取并校准基础下单数量
+	qty, e := b.normalize(b.cfg.Quantity)
+	if e != nil {
+		return nil, e
+	}
+	// step.2 按每层增加前一层 50% 的规则计算数量
+	ratio := new(big.Float).Quo(big.NewFloat(3), big.NewFloat(2))
+	for current := 1; current < layer; current++ {
+		qty.Mul(qty, ratio)
+	}
+	// step.3 按交易所数量步长向下取整并校验最小数量
+	return b.normalize(qty.Text('f', -1))
 }
 
 func (b *Bot) recordFill(o *futures.Order) error {
