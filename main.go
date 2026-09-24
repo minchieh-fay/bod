@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,7 +20,7 @@ import (
 )
 
 const credentialsFile = "/root/key"
-const orderPrefix = "BOD"
+const orderTag = "bod"
 
 type Config struct {
 	Symbol                 string `json:"symbol"`
@@ -200,7 +201,7 @@ func (b *Bot) reconcile(ctx context.Context) error {
 	}
 	actual := map[int64]*futures.Order{}
 	for _, o := range list {
-		if parseLayer(o.ClientOrderID) > 0 {
+		if b.parseLayer(o.ClientOrderID) > 0 {
 			actual[o.OrderID] = o
 		}
 	}
@@ -209,7 +210,7 @@ func (b *Bot) reconcile(ctx context.Context) error {
 	}
 	b.state.Orders = nil
 	for _, o := range actual {
-		n := parseLayer(o.ClientOrderID)
+		n := b.parseLayer(o.ClientOrderID)
 		if n > 0 {
 			b.state.Orders = append(b.state.Orders, ManagedOrder{o.OrderID, o.ClientOrderID, string(o.Side), n, o.Price, o.OrigQuantity, string(o.Status)})
 		}
@@ -384,7 +385,7 @@ func (b *Bot) placeLayer(
 	// step.3 提交交易所订单并保存本地订单状态
 	// Binance requires ETHUSDC prices to have at most two decimal places.
 	qt, pt := qty.Text('f', 3), price.Text('f', 2)
-	id := fmt.Sprintf("%s%d_%d", orderPrefix, layer, time.Now().UnixNano())
+	id := fmt.Sprintf("%s%d_%d", b.orderIDPrefix(), layer, time.Now().UnixNano())
 	o, e := b.client.NewCreateOrderService().Symbol(b.cfg.Symbol).Side(futures.SideType(side)).Type(futures.OrderTypeLimit).TimeInForce(futures.TimeInForceTypeGTC).Quantity(qt).Price(pt).NewClientOrderID(id).Do(ctx)
 	if e != nil {
 		return e
@@ -501,16 +502,31 @@ func floor(v, s *big.Float) *big.Float {
 	i, _ := q.Int(nil)
 	return new(big.Float).Mul(new(big.Float).SetInt(i), s)
 }
-func parseLayer(id string) int {
+
+// parseLayer 解析当前币种订单标识中的挂单层级。
+func (b *Bot) parseLayer(id string) int {
 	p := strings.SplitN(id, "_", 2)
-	if len(p) != 2 || !strings.HasPrefix(p[0], orderPrefix) {
+	prefix := b.orderIDPrefix()
+	if len(p) != 2 || !strings.HasPrefix(p[0], prefix) {
 		return 0
 	}
-	var n int
-	if _, e := fmt.Sscanf(strings.TrimPrefix(p[0], orderPrefix), "%d", &n); e != nil {
+	n, e := strconv.Atoi(strings.TrimPrefix(p[0], prefix))
+	if e != nil {
 		return 0
 	}
 	return n
+}
+
+// orderIDPrefix 根据交易对生成带基础币种和程序标记的订单前缀。
+func (b *Bot) orderIDPrefix() string {
+	symbol := strings.ToUpper(b.cfg.Symbol)
+	for _, quote := range []string{"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USD"} {
+		if strings.HasSuffix(symbol, quote) && len(symbol) > len(quote) {
+			symbol = strings.TrimSuffix(symbol, quote)
+			break
+		}
+	}
+	return strings.ToLower(symbol) + orderTag
 }
 
 func (b *Bot) loadState() error {
