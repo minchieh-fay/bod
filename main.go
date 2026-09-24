@@ -262,10 +262,10 @@ func (b *Bot) createGrid(ctx context.Context) error {
 		return e
 	}
 	for i := 1; i <= b.cfg.Layers; i++ {
-		if e = b.placeLayer(ctx, "BUY", i, ref, ""); e != nil {
+		if e = b.placeLayer(ctx, "BUY", i, ref, "", ""); e != nil {
 			return e
 		}
-		if e = b.placeLayer(ctx, "SELL", i, ref, ""); e != nil {
+		if e = b.placeLayer(ctx, "SELL", i, ref, "", ""); e != nil {
 			return e
 		}
 	}
@@ -304,7 +304,7 @@ func (b *Bot) normalizeSingleSide(ctx context.Context, buys, sells []ManagedOrde
 		return e
 	}
 	for _, o := range cancel {
-		if e = b.placeLayer(ctx, side, 1, ref, o.Quantity); e != nil {
+		if e = b.placeLayer(ctx, side, 1, ref, o.Quantity, ""); e != nil {
 			return e
 		}
 	}
@@ -326,7 +326,7 @@ func (b *Bot) repriceAll(ctx context.Context) error {
 		}
 	}
 	for _, o := range orders {
-		if e = b.placeLayer(ctx, o.Side, o.Layer, ref, o.Quantity); e != nil {
+		if e = b.placeLayer(ctx, o.Side, o.Layer, ref, o.Quantity, o.Price); e != nil {
 			return e
 		}
 	}
@@ -349,6 +349,7 @@ func (b *Bot) placeLayer(
 	layer int,
 	reference string,
 	quantity string,
+	previousPrice string,
 ) error {
 	// step.1 确定新订单数量；调整层和重新定价时沿用原订单数量
 	var qty *big.Float
@@ -379,6 +380,15 @@ func (b *Bot) placeLayer(
 		factor.Add(factor, offset)
 	}
 	price := floor(new(big.Float).Mul(ref, factor), b.rules.Tick)
+	if previousPrice != "" {
+		previous, parseErr := decimal(previousPrice)
+		if parseErr != nil {
+			return parseErr
+		}
+		price.Add(price, previous)
+		price.Quo(price, big.NewFloat(2))
+		price = floor(price, b.rules.Tick)
+	}
 	if price.Sign() <= 0 {
 		return errors.New("calculated price is not positive")
 	}
